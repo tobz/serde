@@ -5,7 +5,7 @@ use proc_macro2::{Spacing, Span, TokenStream, TokenTree};
 use quote::ToTokens;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
-use syn;
+use syn::{self, ExprPath};
 use syn::parse::{self, Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::Ident;
@@ -21,6 +21,25 @@ use syn::NestedMeta::{Lit, Meta};
 // rather than just the first.
 
 pub use internals::case::RenameRule;
+
+/// A name for a container, variant, or field.
+#[derive(Clone)]
+pub enum NameRef {
+	/// A name that is known up front.
+	Known(String),
+
+	/// A path to the name, resolved at compile-time.
+	Path(ExprPath),
+}
+
+impl ToTokens for NameRef {
+    fn to_tokens(&self, out: &mut proc_macro2::TokenStream) {
+        match self {
+			Self::Known(s) => s.to_tokens(out),
+			Self::Path(p) => p.to_tokens(out),
+		}
+    }
+}
 
 struct Attr<'c, T> {
     cx: &'c Ctxt,
@@ -134,9 +153,9 @@ impl<'c, T> VecAttr<'c, T> {
 }
 
 pub struct Name {
-    serialize: String,
+    serialize: NameRef,
     serialize_renamed: bool,
-    deserialize: String,
+    deserialize: NameRef,
     deserialize_renamed: bool,
     deserialize_aliases: Vec<String>,
 }
@@ -152,8 +171,8 @@ fn unraw(ident: &Ident) -> String {
 impl Name {
     fn from_attrs(
         source_name: String,
-        ser_name: Attr<String>,
-        de_name: Attr<String>,
+        ser_name: Option<NameRef>,
+        de_name: Option<NameRef>,
         de_aliases: Option<VecAttr<String>>,
     ) -> Name {
         let deserialize_aliases = match de_aliases {
@@ -167,34 +186,34 @@ impl Name {
             None => Vec::new(),
         };
 
-        let ser_name = ser_name.get();
         let ser_renamed = ser_name.is_some();
-        let de_name = de_name.get();
         let de_renamed = de_name.is_some();
         Name {
-            serialize: ser_name.unwrap_or_else(|| source_name.clone()),
+            serialize: ser_name.unwrap_or_else(|| NameRef::Known(source_name.clone())),
             serialize_renamed: ser_renamed,
-            deserialize: de_name.unwrap_or(source_name),
+            deserialize: de_name.unwrap_or(NameRef::Known(source_name)),
             deserialize_renamed: de_renamed,
             deserialize_aliases,
         }
     }
 
     /// Return the container name for the container when serializing.
-    pub fn serialize_name(&self) -> String {
+    pub fn serialize_name(&self) -> NameRef {
         self.serialize.clone()
     }
 
     /// Return the container name for the container when deserializing.
-    pub fn deserialize_name(&self) -> String {
+    pub fn deserialize_name(&self) -> NameRef {
         self.deserialize.clone()
     }
 
     fn deserialize_aliases(&self) -> Vec<String> {
         let mut aliases = self.deserialize_aliases.clone();
-        let main_name = self.deserialize_name();
-        if !aliases.contains(&main_name) {
-            aliases.push(main_name);
+        // TODO: how could we handle the case where the deser name is a path? does it _need_ to be handled?
+        if let NameRef::Known(main_name) = self.deserialize_name() {
+            if !aliases.contains(&main_name) {
+                aliases.push(main_name);
+            }
         }
         aliases
     }
@@ -290,6 +309,8 @@ impl Container {
     pub fn from_ast(cx: &Ctxt, item: &syn::DeriveInput) -> Self {
         let mut ser_name = Attr::none(cx, RENAME);
         let mut de_name = Attr::none(cx, RENAME);
+        let mut ser_with_name = Attr::none(cx, RENAME_WITH);
+        let mut de_with_name = Attr::none(cx, RENAME_WITH);
         let mut transparent = BoolAttr::none(cx, TRANSPARENT);
         let mut deny_unknown_fields = BoolAttr::none(cx, DENY_UNKNOWN_FIELDS);
         let mut default = Attr::none(cx, DEFAULT);
@@ -319,16 +340,16 @@ impl Container {
                 // Parse `#[serde(rename = "foo")]`
                 Meta(NameValue(m)) if m.path == RENAME => {
                     if let Ok(s) = get_lit_str(cx, RENAME, &m.lit) {
-                        ser_name.set(&m.path, s.value());
-                        de_name.set(&m.path, s.value());
+                        ser_name.set(&m.path, NameRef::Known(s.value()));
+                        de_name.set(&m.path, NameRef::Known(s.value()));
                     }
                 }
 
                 // Parse `#[serde(rename(serialize = "foo", deserialize = "bar"))]`
                 Meta(List(m)) if m.path == RENAME => {
                     if let Ok((ser, de)) = get_renames(cx, &m.nested) {
-                        ser_name.set_opt(&m.path, ser.map(syn::LitStr::value));
-                        de_name.set_opt(&m.path, de.map(syn::LitStr::value));
+                        ser_name.set_opt(&m.path, ser.map(syn::LitStr::value).map(NameRef::Known));
+                        de_name.set_opt(&m.path, de.map(syn::LitStr::value).map(NameRef::Known));
                     }
                 }
 
@@ -360,6 +381,22 @@ impl Container {
                                 Err(err) => cx.error_spanned_by(de, err),
                             }
                         }
+                    }
+                }
+
+                // Parse `#[serde(rename_with = "SER_DESER_NAME_CONST")]`
+                Meta(NameValue(m)) if m.path == RENAME_WITH => {
+                    if let Ok(p) = parse_lit_into_expr_path(cx, RENAME_WITH, &m.lit) {
+                        ser_with_name.set(&m.path, NameRef::Path(p.clone()));
+                        de_with_name.set(&m.path, NameRef::Path(p));
+                    }
+                }
+
+                // Parse `#[serde(rename_with(serialize = "SER_NAME_CONST", deserialize = "DESER_NAME_CONST"))]`
+                Meta(List(m)) if m.path == RENAME_WITH => {
+                    if let Ok((ser, de)) = get_rename_withs(cx, &m.nested) {
+                        ser_with_name.set_opt(&m.path, ser.map(NameRef::Path));
+                        de_with_name.set_opt(&m.path, de.map(NameRef::Path));
                     }
                 }
 
@@ -598,6 +635,9 @@ impl Container {
                 });
             }
         }
+
+        let ser_name = ser_name.get().or(ser_with_name.get());
+        let de_name = de_name.get().or(de_with_name.get());
 
         Container {
             name: Name::from_attrs(unraw(&item.ident), ser_name, de_name, None),
@@ -859,6 +899,8 @@ impl Variant {
     pub fn from_ast(cx: &Ctxt, variant: &syn::Variant) -> Self {
         let mut ser_name = Attr::none(cx, RENAME);
         let mut de_name = Attr::none(cx, RENAME);
+        let mut ser_with_name = Attr::none(cx, RENAME_WITH);
+        let mut de_with_name = Attr::none(cx, RENAME_WITH);
         let mut de_aliases = VecAttr::none(cx, RENAME);
         let mut skip_deserializing = BoolAttr::none(cx, SKIP_DESERIALIZING);
         let mut skip_serializing = BoolAttr::none(cx, SKIP_SERIALIZING);
@@ -881,8 +923,8 @@ impl Variant {
                 // Parse `#[serde(rename = "foo")]`
                 Meta(NameValue(m)) if m.path == RENAME => {
                     if let Ok(s) = get_lit_str(cx, RENAME, &m.lit) {
-                        ser_name.set(&m.path, s.value());
-                        de_name.set_if_none(s.value());
+                        ser_name.set(&m.path, NameRef::Known(s.value()));
+                        de_name.set_if_none(NameRef::Known(s.value()));
                         de_aliases.insert(&m.path, s.value());
                     }
                 }
@@ -890,11 +932,27 @@ impl Variant {
                 // Parse `#[serde(rename(serialize = "foo", deserialize = "bar"))]`
                 Meta(List(m)) if m.path == RENAME => {
                     if let Ok((ser, de)) = get_multiple_renames(cx, &m.nested) {
-                        ser_name.set_opt(&m.path, ser.map(syn::LitStr::value));
+                        ser_name.set_opt(&m.path, ser.map(syn::LitStr::value).map(NameRef::Known));
                         for de_value in de {
-                            de_name.set_if_none(de_value.value());
+                            de_name.set_if_none(NameRef::Known(de_value.value()));
                             de_aliases.insert(&m.path, de_value.value());
                         }
+                    }
+                }
+
+                // Parse `#[serde(rename_with = "SER_DESER_NAME_CONST")]`
+                Meta(NameValue(m)) if m.path == RENAME_WITH => {
+                    if let Ok(p) = parse_lit_into_expr_path(cx, RENAME_WITH, &m.lit) {
+                        ser_with_name.set(&m.path, NameRef::Path(p.clone()));
+                        de_with_name.set(&m.path, NameRef::Path(p));
+                    }
+                }
+
+                // Parse `#[serde(rename_with(serialize = "SER_NAME_CONST", deserialize = "DESER_NAME_CONST"))]`
+                Meta(List(m)) if m.path == RENAME_WITH => {
+                    if let Ok((ser, de)) = get_rename_withs(cx, &m.nested) {
+                        ser_with_name.set_opt(&m.path, ser.map(NameRef::Path));
+                        de_with_name.set_opt(&m.path, de.map(NameRef::Path));
                     }
                 }
 
@@ -1036,6 +1094,9 @@ impl Variant {
             }
         }
 
+        let ser_name = ser_name.get().or(ser_with_name.get());
+        let de_name = de_name.get().or(de_with_name.get());
+
         Variant {
             name: Name::from_attrs(unraw(&variant.ident), ser_name, de_name, Some(de_aliases)),
             rename_all_rules: RenameAllRules {
@@ -1063,10 +1124,16 @@ impl Variant {
 
     pub fn rename_by_rules(&mut self, rules: &RenameAllRules) {
         if !self.name.serialize_renamed {
-            self.name.serialize = rules.serialize.apply_to_variant(&self.name.serialize);
+            match &mut self.name.serialize {
+                NameRef::Known(ser_name) => *ser_name = rules.serialize.apply_to_variant(&ser_name),
+                _ => unreachable!("must be known if not renamed"),
+            }
         }
         if !self.name.deserialize_renamed {
-            self.name.deserialize = rules.deserialize.apply_to_variant(&self.name.deserialize);
+            match &mut self.name.deserialize {
+                NameRef::Known(de_name) => *de_name = rules.deserialize.apply_to_variant(&de_name),
+                _ => unreachable!("must be known if not renamed"),
+            }
         }
     }
 
@@ -1150,6 +1217,8 @@ impl Field {
     ) -> Self {
         let mut ser_name = Attr::none(cx, RENAME);
         let mut de_name = Attr::none(cx, RENAME);
+        let mut ser_with_name = Attr::none(cx, RENAME_WITH);
+        let mut de_with_name = Attr::none(cx, RENAME_WITH);
         let mut de_aliases = VecAttr::none(cx, RENAME);
         let mut skip_serializing = BoolAttr::none(cx, SKIP_SERIALIZING);
         let mut skip_deserializing = BoolAttr::none(cx, SKIP_DESERIALIZING);
@@ -1183,8 +1252,8 @@ impl Field {
                 // Parse `#[serde(rename = "foo")]`
                 Meta(NameValue(m)) if m.path == RENAME => {
                     if let Ok(s) = get_lit_str(cx, RENAME, &m.lit) {
-                        ser_name.set(&m.path, s.value());
-                        de_name.set_if_none(s.value());
+                        ser_name.set(&m.path, NameRef::Known(s.value()));
+                        de_name.set_if_none(NameRef::Known(s.value()));
                         de_aliases.insert(&m.path, s.value());
                     }
                 }
@@ -1192,11 +1261,27 @@ impl Field {
                 // Parse `#[serde(rename(serialize = "foo", deserialize = "bar"))]`
                 Meta(List(m)) if m.path == RENAME => {
                     if let Ok((ser, de)) = get_multiple_renames(cx, &m.nested) {
-                        ser_name.set_opt(&m.path, ser.map(syn::LitStr::value));
+                        ser_name.set_opt(&m.path, ser.map(syn::LitStr::value).map(NameRef::Known));
                         for de_value in de {
-                            de_name.set_if_none(de_value.value());
+                            de_name.set_if_none(NameRef::Known(de_value.value()));
                             de_aliases.insert(&m.path, de_value.value());
                         }
+                    }
+                }
+
+                // Parse `#[serde(rename_with = "SER_DESER_NAME_CONST")]`
+                Meta(NameValue(m)) if m.path == RENAME_WITH => {
+                    if let Ok(p) = parse_lit_into_expr_path(cx, RENAME_WITH, &m.lit) {
+                        ser_with_name.set(&m.path, NameRef::Path(p.clone()));
+                        de_with_name.set(&m.path, NameRef::Path(p));
+                    }
+                }
+
+                // Parse `#[serde(rename_with(serialize = "SER_NAME_CONST", deserialize = "DESER_NAME_CONST"))]`
+                Meta(List(m)) if m.path == RENAME_WITH => {
+                    if let Ok((ser, de)) = get_rename_withs(cx, &m.nested) {
+                        ser_with_name.set_opt(&m.path, ser.map(NameRef::Path));
+                        de_with_name.set_opt(&m.path, de.map(NameRef::Path));
                     }
                 }
 
@@ -1408,6 +1493,9 @@ impl Field {
             collect_lifetimes(&field.ty, &mut borrowed_lifetimes);
         }
 
+        let ser_name = ser_name.get().or(ser_with_name.get());
+        let de_name = de_name.get().or(de_with_name.get());
+
         Field {
             name: Name::from_attrs(ident, ser_name, de_name, Some(de_aliases)),
             skip_serializing: skip_serializing.get(),
@@ -1435,10 +1523,16 @@ impl Field {
 
     pub fn rename_by_rules(&mut self, rules: &RenameAllRules) {
         if !self.name.serialize_renamed {
-            self.name.serialize = rules.serialize.apply_to_field(&self.name.serialize);
+            match &mut self.name.serialize {
+                NameRef::Known(ser_name) => *ser_name = rules.serialize.apply_to_field(&ser_name),
+                _ => unreachable!("must be known if not renamed"),
+            }
         }
         if !self.name.deserialize_renamed {
-            self.name.deserialize = rules.deserialize.apply_to_field(&self.name.deserialize);
+            match &mut self.name.deserialize {
+                NameRef::Known(de_name) => *de_name = rules.deserialize.apply_to_field(&de_name),
+                _ => unreachable!("must be known if not renamed"),
+            }
         }
     }
 
@@ -1548,6 +1642,14 @@ fn get_renames<'a>(
     Ok((ser.at_most_one()?, de.at_most_one()?))
 }
 
+fn get_rename_withs<'a>(
+    cx: &Ctxt,
+    items: &'a Punctuated<syn::NestedMeta, Token![,]>,
+) -> Result<SerAndDe<syn::ExprPath>, ()> {
+    let (ser, de) = get_ser_and_de(cx, RENAME_WITH, items, parse_lit_into_expr_path2)?;
+    Ok((ser.at_most_one()?, de.at_most_one()?))
+}
+
 fn get_multiple_renames<'a>(
     cx: &Ctxt,
     items: &'a Punctuated<syn::NestedMeta, Token![,]>,
@@ -1618,7 +1720,16 @@ fn parse_lit_into_expr_path(
     attr_name: Symbol,
     lit: &syn::Lit,
 ) -> Result<syn::ExprPath, ()> {
-    let string = get_lit_str(cx, attr_name, lit)?;
+    parse_lit_into_expr_path2(cx, attr_name, attr_name, lit)
+}
+
+fn parse_lit_into_expr_path2(
+    cx: &Ctxt,
+    attr_name: Symbol,
+    meta_item_name: Symbol,
+    lit: &syn::Lit,
+) -> Result<syn::ExprPath, ()> {
+    let string = get_lit_str2(cx, attr_name, meta_item_name, lit)?;
     parse_lit_str(string).map_err(|_| {
         cx.error_spanned_by(lit, format!("failed to parse path: {:?}", string.value()));
     })

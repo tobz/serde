@@ -14,6 +14,8 @@ use pretend;
 use std::collections::BTreeSet;
 use std::ptr;
 
+use crate::internals::attr::NameRef;
+
 pub fn expand_derive_deserialize(
     input: &mut syn::DeriveInput,
 ) -> Result<TokenStream, Vec<syn::Error>> {
@@ -1902,7 +1904,7 @@ fn deserialize_untagged_newtype_variant(
 }
 
 fn deserialize_generated_identifier(
-    fields: &[(String, Ident, Vec<String>)],
+    fields: &[(NameRef, Ident, Vec<String>)],
     cattrs: &attr::Container,
     is_variant: bool,
     other_idx: Option<usize>,
@@ -2083,7 +2085,7 @@ fn deserialize_custom_identifier(
 
 fn deserialize_identifier(
     this: &TokenStream,
-    fields: &[(String, Ident, Vec<String>)],
+    fields: &[(NameRef, Ident, Vec<String>)],
     is_variant: bool,
     fallthrough: Option<TokenStream>,
     fallthrough_borrowed: Option<TokenStream>,

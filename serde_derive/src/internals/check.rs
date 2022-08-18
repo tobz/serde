@@ -3,6 +3,8 @@ use internals::attr::{Identifier, TagType};
 use internals::{ungroup, Ctxt, Derive};
 use syn::{Member, Type};
 
+use super::attr::NameRef;
+
 /// Cross-cutting checks that require looking at more than a single attrs
 /// object. Simpler checks should happen when parsing and building the attrs.
 pub fn check(cx: &Ctxt, cont: &mut Container, derive: Derive) {
@@ -270,11 +272,12 @@ fn check_internal_tag_field_name_conflict(cx: &Ctxt, cont: &Container) {
                     let check_ser = !field.attrs.skip_serializing();
                     let check_de = !field.attrs.skip_deserializing();
                     let name = field.attrs.name();
-                    let ser_name = name.serialize_name();
 
-                    if check_ser && ser_name == tag {
-                        diagnose_conflict();
-                        return;
+                    if let NameRef::Known(ser_name) = name.serialize_name() {
+                        if check_ser && ser_name == tag {
+                            diagnose_conflict();
+                            return;
+                        }
                     }
 
                     for de_name in field.attrs.aliases() {

@@ -9,6 +9,8 @@ use internals::ast::{Container, Data, Field, Style, Variant};
 use internals::{attr, replace_receiver, Ctxt, Derive};
 use pretend;
 
+use crate::internals::attr::NameRef;
+
 pub fn expand_derive_serialize(
     input: &mut syn::DeriveInput,
 ) -> Result<TokenStream, Vec<syn::Error>> {
@@ -788,9 +790,9 @@ fn serialize_untagged_variant(
 
 enum TupleVariant {
     ExternallyTagged {
-        type_name: String,
+        type_name: NameRef,
         variant_index: u32,
-        variant_name: String,
+        variant_name: NameRef,
     },
     Untagged,
 }
@@ -857,11 +859,11 @@ fn serialize_tuple_variant(
 enum StructVariant<'a> {
     ExternallyTagged {
         variant_index: u32,
-        variant_name: String,
+        variant_name: NameRef,
     },
     InternallyTagged {
         tag: &'a str,
-        variant_name: String,
+        variant_name: NameRef,
     },
     Untagged,
 }
@@ -870,7 +872,7 @@ fn serialize_struct_variant<'a>(
     context: StructVariant<'a>,
     params: &Parameters,
     fields: &[Field],
-    name: &str,
+    name: &NameRef,
 ) -> Fragment {
     if fields.iter().any(|field| field.attrs.flatten()) {
         return serialize_struct_variant_with_flatten(context, params, fields, name);
@@ -954,7 +956,7 @@ fn serialize_struct_variant_with_flatten<'a>(
     context: StructVariant<'a>,
     params: &Parameters,
     fields: &[Field],
-    name: &str,
+    name: &NameRef,
 ) -> Fragment {
     let struct_trait = StructTrait::SerializeMap;
     let serialize_fields = serialize_struct_visitor(fields, params, true, &struct_trait);
